@@ -134,7 +134,11 @@ where
     }
 
     let result = child.wait_with_output().unwrap();
-    assert!(result.status.success());
+    assert!(result.status.success(),
+        "STDOUT: {:?}\n\n{:?}",
+        ::std::str::from_utf8(&result.stdout),
+        ::std::str::from_utf8(&result.stderr)
+    );
 
     let mut value = None;
     let mut output = &result.stdout[..];

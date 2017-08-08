@@ -20,7 +20,7 @@ extern crate languageserver_types;
 
 pub mod rpc;
 
-use jsonrpc_core::{IoHandler, RpcNotificationSimple, Params, Value};
+use jsonrpc_core::{IoHandler, MetaIoHandler, RpcNotificationSimple, Params, Value};
 
 use url::Url;
 
@@ -350,28 +350,6 @@ fn span_to_range(span: &Span<pos::Location>) -> Range {
     }
 }
 
-struct TextDocumentDidOpen(RootedThread);
-impl LanguageServerNotification<DidOpenTextDocumentParams> for TextDocumentDidOpen {
-    fn execute(&self, change: DidOpenTextDocumentParams) {
-        run_diagnostics(
-            &self.0,
-            &change.text_document.uri,
-            &change.text_document.text,
-        );
-    }
-}
-
-struct TextDocumentDidChange(Arc<UniqueQueue<Url, String>>);
-impl LanguageServerNotification<DidChangeTextDocumentParams> for TextDocumentDidChange {
-    fn execute(&self, mut change: DidChangeTextDocumentParams) {
-        use std::mem::replace;
-        self.0.add_work(
-            change.text_document.uri,
-            replace(&mut change.content_changes[0].text, String::new()),
-        )
-    }
-}
-
 fn strip_file_prefix_with_thread(thread: &Thread, url: &Url) -> String {
     let import = thread.get_macros().get("import").expect("Import macro");
     let import = import
@@ -614,6 +592,23 @@ fn run_diagnostics(thread: &Thread, filename: &Url, fileinput: &str) {
     }
 }
 
+pub trait N {
+    fn add_notification<T, F>(&mut self, f: F)
+    where T: languageserver_types::Notification,
+          T::Param: 'static,
+          F: Fn(T::Param) + Send + Sync + 'static;
+}
+
+impl N for IoHandler {
+    fn add_notification<T, F>(&mut self, f: F)
+    where T: languageserver_types::Notification,
+          T::Param: 'static,
+          F: Fn(T::Param) + Send + Sync + 'static
+    {
+        MetaIoHandler::add_notification(self, T::method(), ServerCommand::new(f))
+    }
+}
+
 pub fn run() {
     ::env_logger::init().unwrap();
 
@@ -719,18 +714,31 @@ pub fn run() {
             let exit_token = Arc::new(AtomicBool::new(false));
             {
                 let exit_token = exit_token.clone();
-                io.add_notification("exit", move |_| {
+                io.add_notification::<Exit, _>(move |_| {
                     exit_token.store(true, atomic::Ordering::SeqCst)
                 });
             }
-            io.add_notification(
-                "textDocument/didOpen",
-                ServerCommand::new(TextDocumentDidOpen(thread.clone())),
-            );
-            io.add_notification(
-                "textDocument/didChange",
-                ServerCommand::new(TextDocumentDidChange(work_queue.clone())),
-            );
+            {
+                let thread = thread.clone();
+                io.add_notification::<DidOpenTextDocumentParams, _>(move |change| {
+                    run_diagnostics(
+                        &thread,
+                        &change.text_document.uri,
+                        &change.text_document.text,
+                    );
+                });
+            }
+
+            {
+                let work_queue = work_queue.clone();
+                io.add_notification::<DidChangeTextDocumentParams, _>(move |mut change| {
+                    use std::mem::replace;
+                    work_queue.add_work(
+                        change.text_document.uri,
+                        replace(&mut change.content_changes[0].text, String::new()),
+                    )
+                });
+            }
 
             let mut input = BufReader::new(io::stdin());
             let mut output = io::stdout();
