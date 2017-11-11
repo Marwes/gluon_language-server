@@ -1,8 +1,8 @@
+use std::collections::VecDeque;
 use std::env;
-use std::io::{self, Write};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::io::{self, Read, Write};
 use std::str;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 
 use jsonrpc_core::request::{Call, MethodCall, Notification};
 use jsonrpc_core::version::Version;
@@ -20,6 +20,9 @@ use url::Url;
 use languageserver_types::{DidOpenTextDocumentParams, TextDocumentItem};
 
 use gluon_language_server::rpc::read_message;
+
+extern crate gluon;
+use self::gluon::new_vm;
 
 pub fn test_url(uri: &str) -> Url {
     Url::from_file_path(&env::current_dir().unwrap().join(uri)).unwrap()
@@ -99,28 +102,23 @@ where
     did_open_uri(stdin, test_url(uri), text)
 }
 
+
 pub fn send_rpc<F, T>(f: F) -> T
 where
     F: FnOnce(&mut Write),
     T: DeserializeOwned,
 {
-    let args: Vec<_> = env::args().collect();
-    let server_path = Path::new(&args[0][..])
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("folder")
-        .join("gluon_language-server");
-    let mut child = Command::new(&*server_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap_or_else(|err| {
-            panic!("{}\nWhen opening `{}`", err, server_path.display())
-        });
+    let (stdin_read, mut stdin_write) = pipe();
+    let (mut stdout_read, stdout_write) = pipe();
+
+    ::std::thread::spawn(move || {
+        let thread = new_vm();
+
+        ::gluon_language_server::start_server(thread, stdin_read, stdout_write).unwrap();
+    });
 
     {
-        let mut stdin = child.stdin.as_mut().expect("stdin");
+        let mut stdin = &mut stdin_write;
 
         f(stdin);
 
@@ -132,11 +130,11 @@ where
         write_message(&mut stdin, exit).unwrap();
     }
 
-    let result = child.wait_with_output().unwrap();
-    assert!(result.status.success());
+    let mut stdout = Vec::new();
+    stdout_read.read_to_end(&mut stdout).unwrap();
 
     let mut value = None;
-    let mut output = &result.stdout[..];
+    let mut output = &stdout[..];
     while let Some(json) = read_message(&mut output).unwrap() {
         if let Ok(Response::Single(Output::Success(response))) = from_str(&json) {
             value = from_value(response.result).ok();
@@ -157,7 +155,83 @@ where
     value.unwrap_or_else(|| {
         panic!(
             "Could not find the expected response out of:\n`{}`",
-            str::from_utf8(&result.stdout).expect("UTF8")
+            str::from_utf8(&stdout).expect("UTF8")
         )
     })
+}
+
+
+pub struct ReadPipe {
+    recv: Receiver<Vec<u8>>,
+    buffer: VecDeque<u8>,
+}
+
+impl Drop for ReadPipe {
+    fn drop(&mut self) {
+        "123".to_owned();
+    }
+}
+
+impl Drop for WritePipe {
+    fn drop(&mut self) {
+        "123".to_owned();
+    }
+}
+
+
+impl io::Read for ReadPipe {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let l = buffer.len().min(self.buffer.len());
+        for (to, from) in buffer.iter_mut().zip(self.buffer.drain(..l)) {
+            *to = from;
+        }
+        match self.recv.try_recv() {
+            Ok(buf) => {
+                self.buffer.extend(buf);
+                let extra = self.read(&mut buffer[l..])?;
+                Ok(l + extra)
+            }
+            Err(TryRecvError::Disconnected) => Err(io::Error::from(io::ErrorKind::NotConnected)),
+            Err(_) => Ok(l),
+        }
+    }
+
+    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> io::Result<usize> {
+        let len = buffer.len();
+        buffer.extend(self.buffer.drain(..));
+        while let Ok(buf) = self.recv.recv() {
+            buffer.extend(buf);
+        }
+        Ok(buffer.len() - len)
+    }
+}
+
+pub struct WritePipe {
+    sender: SyncSender<Vec<u8>>,
+}
+
+impl io::Write for WritePipe {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.sender.send(data.to_owned()).map_err(|_| {
+            eprintln!("{:?}", str::from_utf8(data));
+            io::Error::from(io::ErrorKind::NotConnected)
+        })?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+
+fn pipe() -> (ReadPipe, WritePipe) {
+    let (sender, receiver) = sync_channel(10);
+    (
+        ReadPipe {
+            recv: receiver,
+            buffer: VecDeque::new(),
+        },
+        WritePipe { sender },
+    )
 }

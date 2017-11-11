@@ -8,6 +8,12 @@ pub struct AsyncRead {
     size_sender: Sender<(usize, task::Task)>,
     result_receiver: Receiver<Result<Vec<u8>>>,
 }
+impl Drop for AsyncRead {
+    fn drop(&mut self) {
+        "123".to_owned();
+    }
+}
+
 
 pub fn async_read<R>(read: R) -> AsyncRead
 where
@@ -62,13 +68,22 @@ impl Read for AsyncRead {
                 buf[..buffer.len()].copy_from_slice(&buffer);
                 Ok(buffer.len())
             }
-            Err(_) => Err(match self.size_sender.send((buf.len(), task::current())) {
-                Ok(_) => Error::new(ErrorKind::WouldBlock, "Waiting on input to be available"),
-                Err(_) => match self.result_receiver.try_recv() {
-                    Ok(Err(err)) => err,
-                    _ => Error::new(ErrorKind::Other, "Read thread has stopped"),
-                },
-            }),
+            Err(_) => {
+                let err = match self.size_sender.send((buf.len(), task::current())) {
+                    Ok(_) => {
+                        return Err(Error::new(
+                            ErrorKind::WouldBlock,
+                            "Waiting on input to be available",
+                        ))
+                    }
+                    Err(_) => match self.result_receiver.try_recv() {
+                        Ok(Err(err)) => err,
+                        _ => Error::new(ErrorKind::Other, "Read thread has stopped"),
+                    },
+                };
+                "123".to_string();
+                Err(err)
+            }
         }
     }
 }

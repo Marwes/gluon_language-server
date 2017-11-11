@@ -71,7 +71,7 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 use std::str;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use languageserver_types::*;
 
@@ -670,11 +670,6 @@ pub fn run() {
         .get_matches();
 
     let thread = new_vm();
-    {
-        let macros = thread.get_macros();
-        let import = Import::new(CheckImporter::new());
-        macros.insert("import".into(), import);
-    }
 
     start_server(thread, io::stdin(), io::stdout()).unwrap();
 }
@@ -688,6 +683,26 @@ where
     R: io::Read + Send + 'static,
     W: io::Write + Send,
 {
+    {
+        let macros = thread.get_macros();
+        let mut check_import = Import::new(CheckImporter::new());
+        {
+            let import = macros.get("import").expect("Import macro");
+            let import = import.downcast_ref::<Import>().expect("Importer");
+            check_import.paths = RwLock::new((*import.paths.read().unwrap()).clone());
+            check_import.loaders = RwLock::new(
+                import
+                    .loaders
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect(),
+            );
+        }
+        macros.insert("import".into(), check_import);
+    }
+
     let mut core = reactor::Core::new().unwrap();
     let (io, exit_receiver, _cpu_pool, message_log_receiver, message_log) =
         initialize_rpc(&thread, core.remote());
@@ -716,6 +731,9 @@ where
                     Either::B(Ok(()).into_future())
                 }
             })
+        }).then(|x| {
+            info!("{:?}", x);
+            x
         }),
     );
 
@@ -740,7 +758,13 @@ where
     core.run(
         future::select_all(vec![
             future,
-            Box::new(exit_receiver.map_err(|_| "Exit was canceled".into())),
+            Box::new(
+                exit_receiver
+                    .map(|_| {
+                        info!("Exiting");
+                    })
+                    .map_err(|_| "Exit was canceled".into()),
+            ),
             log_messages,
         ]).map(|t| t.0)
             .map_err(|t| t.0),
@@ -759,7 +783,10 @@ fn initialize_rpc(
     mpsc::Receiver<String>,
     mpsc::Sender<String>,
 ) {
-    let cpu_pool = CpuPool::new(2);
+    let cpu_pool = futures_cpupool::Builder::new()
+        .pool_size(2)
+        .name_prefix("gluon_worker_")
+        .create();
 
     let (message_log, message_log_receiver) = mpsc::channel(1);
 

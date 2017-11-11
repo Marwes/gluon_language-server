@@ -8,6 +8,8 @@ extern crate serde;
 extern crate serde_json;
 extern crate url;
 
+extern crate gluon;
+
 mod support;
 
 use std::io::Write;
@@ -232,6 +234,7 @@ let test = 2
 let test1 = ""
 test2
 "#;
+
         support::did_open(stdin, "test", text);
 
         did_change(
